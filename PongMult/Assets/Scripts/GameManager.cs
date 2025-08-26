@@ -1,74 +1,166 @@
-﻿using UnityEngine;
+﻿using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Netcode;
 using UnityEngine.UI;
 
-[DefaultExecutionOrder(-1)]
-public class GameManager : MonoBehaviour
+public class GameManager : NetworkBehaviour
 {
-    [SerializeField] private Ball ball;
-    [SerializeField] private Paddle player1Paddle;
-    [SerializeField] private Paddle player2Paddle;
-    [SerializeField] private Text player1ScoreText;
-    [SerializeField] private Text player2ScoreText;
+    public static GameManager Instance { get; private set; }
 
-    private int player1Score;
-    private int player2Score;
+    [Header("UI")]
+    public Text player1ScoreText;
+    public Text player2ScoreText;
 
-    private void Start()
+    [Header("Prefabs")]
+    public NetworkObject ballPrefab;
+
+    [Header("Spawn X")]
+    public float leftX = -8.5f;
+    public float rightX = 8.5f;
+
+    private NetworkVariable<int> p1Score = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    private NetworkVariable<int> p2Score = new NetworkVariable<int>(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    private NetworkObject currentBall;
+    private readonly List<ulong> playerOrder = new List<ulong>(2);
+
+    private void Awake()
     {
-        NewGame();
+        if (Instance == null) Instance = this;
+        else Destroy(gameObject);
     }
 
-    private void Update()
+    public override void OnNetworkSpawn()
     {
-        if (Input.GetKeyDown(KeyCode.R))
+        p1Score.OnValueChanged += (_, v) => { if (player1ScoreText) player1ScoreText.text = v.ToString(); };
+        p2Score.OnValueChanged += (_, v) => { if (player2ScoreText) player2ScoreText.text = v.ToString(); };
+
+        if (IsServer)
         {
-            NewGame();
+            NetworkManager.OnClientConnectedCallback += OnClientConnected;
+            NetworkManager.OnClientDisconnectCallback += OnClientDisconnected;
         }
     }
 
-    public void NewGame()
+    protected override void OnDestroy()
     {
-        SetPlayer1Score(0);
-        SetPlayer2Score(0);
-        NewRound();
+        if (IsServer && NetworkManager != null)
+        {
+            NetworkManager.OnClientConnectedCallback -= OnClientConnected;
+            NetworkManager.OnClientDisconnectCallback -= OnClientDisconnected;
+        }
+        base.OnDestroy();
     }
 
-    public void NewRound()
+    private void OnClientConnected(ulong clientId)
     {
-        player1Paddle.ResetPosition();
-        player2Paddle.ResetPosition();
-        ball.ResetPosition();
-
-        CancelInvoke();
-        Invoke(nameof(StartRound), 1f);
+        if (!playerOrder.Contains(clientId)) playerOrder.Add(clientId);
+        StartCoroutine(TryStartMatch());
     }
 
-    private void StartRound()
+    private void OnClientDisconnected(ulong clientId)
     {
-        ball.AddStartingForce();
+        playerOrder.Remove(clientId);
+        // opcional: resetar ou pausar jogo
+        ResetGameServer();
     }
 
-    public void OnPlayer1Scored()
+    private IEnumerator TryStartMatch()
     {
-        SetPlayer1Score(player1Score + 1);
-        NewRound();
+        // espera até termos 2 jogadores (pode ajustar para aceitar mais)
+        while (playerOrder.Count < 2 ||
+               !NetworkManager.ConnectedClients.ContainsKey(playerOrder[0]) ||
+               !NetworkManager.ConnectedClients.ContainsKey(playerOrder[1]) ||
+               NetworkManager.ConnectedClients[playerOrder[0]].PlayerObject == null ||
+               NetworkManager.ConnectedClients[playerOrder[1]].PlayerObject == null)
+        {
+            yield return null;
+        }
+
+        // posiciona paddles
+        var p0 = NetworkManager.ConnectedClients[playerOrder[0]].PlayerObject;
+        var p1 = NetworkManager.ConnectedClients[playerOrder[1]].PlayerObject;
+
+        if (p0 != null) p0.transform.position = new Vector2(leftX, 0f);
+        if (p1 != null) p1.transform.position = new Vector2(rightX, 0f);
+
+        ResetGameServer();
     }
 
-    public void OnPlayer2Scored()
+    [ServerRpc(RequireOwnership = false)]
+    public void RequestNewRoundServerRpc(ServerRpcParams rpcParams = default)
     {
-        SetPlayer2Score(player2Score + 1);
-        NewRound();
+        // quem chamar ServerRpc pede uma nova rodada; server executa
+        NewRoundServer();
     }
 
-    private void SetPlayer1Score(int score)
+    private void ResetGameServer()
     {
-        player1Score = score;
-        player1ScoreText.text = score.ToString();
+        // feito no servidor
+        if (!IsServer) return;
+        p1Score.Value = 0;
+        p2Score.Value = 0;
+        NewRoundServer();
     }
 
-    private void SetPlayer2Score(int score)
+    private void NewRoundServer()
     {
-        player2Score = score;
-        player2ScoreText.text = score.ToString();
+        if (!IsServer) return;
+
+        // reposiciona paddles
+        foreach (var kv in NetworkManager.ConnectedClients)
+        {
+            var playerObj = kv.Value.PlayerObject;
+            if (playerObj == null) continue;
+            var rb = playerObj.GetComponent<Rigidbody2D>();
+            bool isLeft = kv.Key == playerOrder[0];
+            if (rb != null)
+            {
+                rb.linearVelocity = Vector2.zero;
+                rb.position = new Vector2(isLeft ? leftX : rightX, 0f);
+            }
+            else
+            {
+                playerObj.transform.position = new Vector2(isLeft ? leftX : rightX, 0f);
+            }
+        }
+
+        // respawn da bola
+        if (currentBall != null && currentBall.IsSpawned)
+        {
+            currentBall.Despawn(true);
+            currentBall = null;
+        }
+
+        currentBall = Instantiate(ballPrefab);
+        currentBall.Spawn(true);
+
+        StartCoroutine(StartBallAfterDelay());
+    }
+
+    private IEnumerator StartBallAfterDelay()
+    {
+        yield return new WaitForSeconds(1f);
+        if (currentBall != null && currentBall.TryGetComponent<Ball>(out var nb))
+        {
+            // chame o método do servidor diretamente (evita RPC se já estamos no servidor)
+            nb.AddStartingForce();
+        }
+    }
+
+    // chamados pelo ScoringZone (servidor)
+    public void Player1Scored()
+    {
+        if (!IsServer) return;
+        p1Score.Value++;
+        NewRoundServer();
+    }
+
+    public void Player2Scored()
+    {
+        if (!IsServer) return;
+        p2Score.Value++;
+        NewRoundServer();
     }
 }
